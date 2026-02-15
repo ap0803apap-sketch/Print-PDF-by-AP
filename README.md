@@ -1,3 +1,6 @@
+<img width="1080" height="2242" alt="Screenshot_20260215_175917_Print PDF by AP" src="https://github.com/user-attachments/assets/bea4e20f-ddbf-40c9-b251-d8eacb20e7be" />
+<img width="1080" height="4197" alt="Screenshot_20260215_175928_Print PDF by AP" src="https://github.com/user-attachments/assets/68cdb064-6787-453e-964c-54d20929efdf" />
+<img width="1080" height="2254" alt="Screenshot_20260215_175913_Print PDF by AP" src="https://github.com/user-attachments/assets/7dc36ff1-e4de-4b88-8644-3d7faf0e282c" />
 📄 Print PDF by AP
 
 Print PDF by AP is a modern Android app built with Jetpack Compose that lets users import PDFs, preview pages, customize print layouts (N-Up, margins, scaling, orientation), and export optimized PDFs directly to their Downloads folder.
