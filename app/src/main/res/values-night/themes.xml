@@ -1,0 +1,6 @@
+<resources>
+    <!-- Base application theme. -->
+    <style name="Theme.PrintPDFbyAP" parent="Theme.Material3.Dark.NoActionBar">
+        <!-- Customize your dark theme here. -->
+    </style>
+</resources>
