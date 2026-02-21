@@ -7,26 +7,41 @@ It also supports opening PDFs directly from Android’s Share menu.
 
 ✨ Features
 
-✅ Import PDFs from device or Share menu
-✅ Live preview of first page
+✅ Import PDFs from device or Android Share menu
+✅ Import multiple images and convert them into a PDF
+✅ Replace current PDF or images anytime from inside the editor
+✅ Live preview of first page / generated document
 ✅ Page selection (All / Odd / Even / Custom ranges)
 ✅ N-Up layouts (1, 2, 4, 6, 9, 16 per sheet)
-✅ Portrait & Landscape orientation
+✅ Portrait & Landscape orientation with visual icons
 ✅ Custom scaling (10%–200%)
 ✅ Preset or custom margins
 ✅ Optional page borders
-✅ Single-sided / Double-sided mode
-✅ AMOLED-friendly dark mode
-✅ Dynamic Material You colors (Android 12+)
+✅ Single-sided / Double-sided print mode
+✅ Modern expressive Material 3 UI
+✅ AMOLED-friendly dark mode (white text + pink accents)
+✅ Dynamic Material You colors (Android 12+) applied across the whole app
 ✅ Theme preference is remembered
-✅ Saves output to:
-
-Downloads/PrintPDFByAP
-
-
+✅ Pick files using gallery apps or file managers (Samsung My Files, etc.)
+✅ Save output directly to:
+         "Downloads/PrintPDFByAP"
 ✅ Toast + notification after save
 ✅ Tap notification to open saved PDF
 ✅ Contact developer directly via email
-<img width="1080" height="2242" alt="Screenshot_20260215_175917_Print PDF by AP" src="https://github.com/user-attachments/assets/bea4e20f-ddbf-40c9-b251-d8eacb20e7be" />
-<img width="1080" height="4197" alt="Screenshot_20260215_175928_Print PDF by AP" src="https://github.com/user-attachments/assets/68cdb064-6787-453e-964c-54d20929efdf" />
-<img width="1080" height="2254" alt="Screenshot_20260215_175913_Print PDF by AP" src="https://github.com/user-attachments/assets/7dc36ff1-e4de-4b88-8644-3d7faf0e282c" />
+
+
+<img width="1079" height="2260" alt="02" src="https://github.com/user-attachments/assets/4ffe47a3-0d67-4931-acb7-f34db395be1d" />
+
+
+<img width="1080" height="4298" alt="01" src="https://github.com/user-attachments/assets/a566902e-1654-4a1f-8f05-13dc17a66644" />
+
+
+<img width="1079" height="2260" alt="03" src="https://github.com/user-attachments/assets/6e323776-38b0-41c3-b8d0-81aed73c23f0" />
+
+
+
+
+
+
+
+
