@@ -22,6 +22,8 @@ class PdfProcessingService : Service() {
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(Dispatchers.Default + Job())
     private var notificationManager: NotificationManager? = null
+    private var cachedImageBitmaps: List<Bitmap> = emptyList()
+    private val notificationId = 1
 
     var onProgress: ((Float, String) -> Unit)? = null
     var onPreviewReady: ((Bitmap) -> Unit)? = null
@@ -36,7 +38,7 @@ class PdfProcessingService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        startForeground(1, createNotification(0, "Initializing Service..."))
+        startForeground(notificationId, createNotification(0, "Initializing Service..."))
     }
 
     // ================= LOAD PDF =================
@@ -44,6 +46,7 @@ class PdfProcessingService : Service() {
     fun loadPdf(uri: Uri, contentResolver: android.content.ContentResolver) {
         serviceScope.launch {
             try {
+                cachedImageBitmaps = emptyList()
                 updateNotification(0, "Importing PDF...")
                 onProgress?.invoke(0.1f, "Opening file...")
 
@@ -79,203 +82,358 @@ class PdfProcessingService : Service() {
         }
     }
 
+    fun processImages(uris: List<Uri>, context: Context, settings: PdfSettings) {
+        serviceScope.launch(Dispatchers.Default) {
+            try {
+                updateNotification(0, "Loading images...")
+
+                onProgress?.invoke(0.1f, "Loading images...")
+
+                val bitmaps = mutableListOf<Bitmap>()
+                for ((index, uri) in uris.withIndex()) {
+                    val progress = 0.2f + (index.toFloat() / uris.size) * 0.6f
+                    onProgress?.invoke(progress, "Loading image ${index + 1}/${uris.size}...")
+
+                    val bitmap = loadBitmapFromUri(uri, context)
+                    if (bitmap != null) {
+                        bitmaps.add(bitmap)
+                    }
+                }
+
+                if (bitmaps.isNotEmpty()) {
+                    onProgress?.invoke(0.85f, "Preparing preview...")
+                    // Show first image as preview
+                    onPreviewReady?.invoke(bitmaps[0])
+
+                    // Cache bitmaps for printing
+                    cachedImageBitmaps = bitmaps
+                }
+
+                onProgress?.invoke(1.0f, "Ready to print (${bitmaps.size} images)")
+            } catch (e: Exception) {
+                onProgress?.invoke(1.0f, "Error: ${e.message}")
+            }
+        }
+    }
+
     // ================= SAVE PDF =================
 
     fun savePdf(context: Context, settings: PdfSettings, originalFileName: String) {
         serviceScope.launch {
-            try {
-                updateNotification(0, "Processing PDF...")
-                onProgress?.invoke(0f, "Starting render...")
-
-                val inputFile = File(cacheDir, "temp_import.pdf")
-                if (!inputFile.exists()) return@launch
-
-                val inputFd =
-                    ParcelFileDescriptor.open(inputFile, ParcelFileDescriptor.MODE_READ_ONLY)
-                val renderer = PdfRenderer(inputFd)
-                val totalInputPages = renderer.pageCount
-
-                // 1. Get pages to process based on selection
-                val pagesToProcess = when (settings.pageSelectionType) {
-                    PageSelectionType.ALL -> (0 until totalInputPages).toList()
-                    PageSelectionType.ODD -> (0 until totalInputPages).filter { (it + 1) % 2 != 0 }
-                    PageSelectionType.EVEN -> (0 until totalInputPages).filter { (it + 1) % 2 == 0 }
-                    PageSelectionType.CUSTOM -> parseCustomPages(settings.customPageString, totalInputPages)
-                }
-
-                // 2. Apply double-sided printing: insert blank pages
-                val finalPagesList = if (settings.printingMode == PrintingMode.DOUBLE_SIDED) {
-                    val result = mutableListOf<Int?>()
-                    for (pageIndex in pagesToProcess) {
-                        result.add(pageIndex)  // Actual page
-                        result.add(null)       // Null = blank page
-                    }
-                    result.dropLast(1) // Remove last blank page
-                } else {
-                    pagesToProcess.map { it as Int? }
-                }
-
-                // 3. Setup output document
-                val outputDoc = PdfDocument()
-                val (outW, outH) =
-                    PageSizeUtils.getDimensions(settings.pageSizeName, settings.orientation)
-
-                // 4. Calculate spacing between pages
-                val spacingBetweenPages = if (settings.marginType == MarginType.PRESET) {
-                    MarginPresets.getMarginInPoints(settings.marginPreset)
-                } else {
-                    MarginPresets.convertMmToPoints(settings.customMarginMm)
-                }
-
-                // 5. Calculate N-up grid (cols × rows)
-                val (cols, rows) = when (settings.pagesPerSheet) {
-                    1 -> 1 to 1
-                    2 -> if (settings.orientation == Orientation.LANDSCAPE) 2 to 1 else 1 to 2
-                    4 -> 2 to 2
-                    6 -> if (settings.orientation == Orientation.LANDSCAPE) 3 to 2 else 2 to 3
-                    9 -> 3 to 3
-                    16 -> 4 to 4
-                    else -> 1 to 1
-                }
-
-                // 6. Calculate cell size with spacing
-                val totalSpacingWidth = spacingBetweenPages * (cols - 1)
-                val totalSpacingHeight = spacingBetweenPages * (rows - 1)
-                val availableW = outW - totalSpacingWidth
-                val availableH = outH - totalSpacingHeight
-                val cellW = availableW / cols
-                val cellH = availableH / rows
-
-                var itemsOnPage = 0
-                var currentPageInfo: PdfDocument.PageInfo? = null
-                var currentPage: PdfDocument.Page? = null
-                var canvas: Canvas? = null
-
-                // 7. Process each page
-                for ((index, pageIndex) in finalPagesList.withIndex()) {
-                    val progress = (index.toFloat() / finalPagesList.size * 100).toInt()
-                    updateNotification(progress, "Rendering ${index + 1}/${finalPagesList.size}")
-                    onProgress?.invoke(progress / 100f, "Rendering...")
-
-                    // Start new sheet if needed
-                    if (itemsOnPage == 0) {
-                        currentPageInfo =
-                            PdfDocument.PageInfo.Builder(outW.toInt(), outH.toInt(), index + 1)
-                                .create()
-                        currentPage = outputDoc.startPage(currentPageInfo)
-                        canvas = currentPage!!.canvas
-                        canvas.drawColor(Color.WHITE)
-                    }
-
-                    // Check if blank page or content page
-                    if (pageIndex != null) {
-                        // Render actual content page
-                        val inpPage = renderer.openPage(pageIndex)
-                        val bitmapW = inpPage.width * 2
-                        val bitmapH = inpPage.height * 2
-                        val bitmap =
-                            Bitmap.createBitmap(bitmapW, bitmapH, Bitmap.Config.ARGB_8888)
-                        inpPage.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                        inpPage.close()
-
-                        // Calculate grid position (left-to-right, top-to-bottom)
-                        val col = itemsOnPage % cols
-                        val row = itemsOnPage / cols
-                        val cellX = col * (cellW + spacingBetweenPages)
-                        val cellY = row * (cellH + spacingBetweenPages)
-
-                        // Calculate scale
-                        var scale = 1.0f
-                        if (settings.scaleType == ScaleType.CUSTOM) {
-                            scale = settings.customScalePercent / 100f
-                        }
-
-                        // Fit bitmap to cell maintaining aspect ratio
-                        val aspectSrc = bitmap.width.toFloat() / bitmap.height
-                        val aspectDst = cellW / cellH
-
-                        var drawW = cellW
-                        var drawH = cellH
-
-                        if (aspectSrc > aspectDst) {
-                            drawH = drawW / aspectSrc
-                        } else {
-                            drawW = drawH * aspectSrc
-                        }
-
-                        // Apply custom scale
-                        drawW *= scale
-                        drawH *= scale
-
-                        // Center in cell
-                        val offX = cellX + (cellW - drawW) / 2
-                        val offY = cellY + (cellH - drawH) / 2
-
-                        val destRect = RectF(offX, offY, offX + drawW, offY + drawH)
-
-                        // Draw bitmap
-                        val paint = Paint().apply {
-                            isFilterBitmap = true
-                            isAntiAlias = true
-                        }
-                        canvas!!.drawBitmap(bitmap, null, destRect, paint)
-
-                        // Draw page borders if enabled
-                        if (settings.showBorder) {
-                            val borderPaint = Paint().apply {
-                                color = Color.LTGRAY
-                                style = Paint.Style.STROKE
-                                strokeWidth = 1f
-                            }
-                            canvas!!.drawRect(destRect, borderPaint)
-                        }
-
-                        bitmap.recycle()
-                    }
-                    // If pageIndex is null, it's a blank page - don't draw anything
-
-                    itemsOnPage++
-
-                    // If sheet full, finish page
-                    if (itemsOnPage >= settings.pagesPerSheet) {
-                        outputDoc.finishPage(currentPage)
-                        itemsOnPage = 0
-                    }
-                }
-
-                // Finish last page if incomplete
-                if (itemsOnPage > 0) {
-                    outputDoc.finishPage(currentPage)
-                }
-
-                renderer.close()
-                inputFd.close()
-
-                onProgress?.invoke(0.9f, "Saving file...")
-
-                val timeStamp =
-                    SimpleDateFormat("HHmmss", Locale.getDefault()).format(Date())
-                val finalName = "${originalFileName}_PrintPDF_$timeStamp.pdf"
-
-                val outputUri = saveToDownloads(context, outputDoc, finalName)
-                outputDoc.close()
-
-                // Remove progress notification
-                stopForeground(STOP_FOREGROUND_REMOVE)
-
-                // Show success notification
-                showSavedNotification(finalName, outputUri)
-
-                onProgress?.invoke(1.0f, "Done!")
-                onComplete?.invoke(outputUri)
-
-                // Stop service
-                stopSelf()
-
-            } catch (e: Exception) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                e.printStackTrace()
+            if (cachedImageBitmaps.isNotEmpty()) {
+                saveImagesAsPdf(context, settings, originalFileName)
+            } else {
+                savePdfFromPdf(context, settings, originalFileName)
             }
+        }
+    }
+
+    private suspend fun saveImagesAsPdf(context: Context, settings: PdfSettings, originalFileName: String) {
+        try {
+            updateNotification(0, "Processing Images into PDF...")
+            onProgress?.invoke(0f, "Starting render...")
+
+            val imagesToProcess = cachedImageBitmaps
+
+            val finalImagesList = if (settings.printingMode == PrintingMode.DOUBLE_SIDED) {
+                val result = mutableListOf<Bitmap?>()
+                for (image in imagesToProcess) {
+                    result.add(image)
+                    result.add(null)
+                }
+                result.dropLast(1)
+            } else {
+                imagesToProcess.map { it as Bitmap? }
+            }
+
+            val outputDoc = PdfDocument()
+            val (outW, outH) = PageSizeUtils.getDimensions(settings.pageSizeName, settings.orientation)
+
+            val spacingBetweenPages = if (settings.marginType == MarginType.PRESET) {
+                MarginPresets.getMarginInPoints(settings.marginPreset)
+            } else {
+                MarginPresets.convertMmToPoints(settings.customMarginMm)
+            }
+
+            val (cols, rows) = when (settings.pagesPerSheet) {
+                1 -> 1 to 1
+                2 -> if (settings.orientation == Orientation.LANDSCAPE) 2 to 1 else 1 to 2
+                4 -> 2 to 2
+                6 -> if (settings.orientation == Orientation.LANDSCAPE) 3 to 2 else 2 to 3
+                9 -> 3 to 3
+                16 -> 4 to 4
+                else -> 1 to 1
+            }
+
+            val totalSpacingWidth = spacingBetweenPages * (cols - 1)
+            val totalSpacingHeight = spacingBetweenPages * (rows - 1)
+            val availableW = outW - totalSpacingWidth
+            val availableH = outH - totalSpacingHeight
+            val cellW = availableW / cols
+            val cellH = availableH / rows
+
+            var itemsOnPage = 0
+            var currentPageInfo: PdfDocument.PageInfo? = null
+            var currentPage: PdfDocument.Page? = null
+            var canvas: Canvas? = null
+
+            for ((index, bitmap) in finalImagesList.withIndex()) {
+                updateNotification(index * 100 / finalImagesList.size, "Rendering image ${index + 1}/${finalImagesList.size}")
+                onProgress?.invoke(index.toFloat() / finalImagesList.size, "Rendering...")
+
+                if (itemsOnPage == 0) {
+                    currentPageInfo = PdfDocument.PageInfo.Builder(outW.toInt(), outH.toInt(), index + 1).create()
+                    currentPage = outputDoc.startPage(currentPageInfo)
+                    canvas = currentPage.canvas
+                    canvas.drawColor(Color.WHITE)
+                }
+
+                if (bitmap != null) {
+                    val col = itemsOnPage % cols
+                    val row = itemsOnPage / cols
+                    val cellX = col * (cellW + spacingBetweenPages)
+                    val cellY = row * (cellH + spacingBetweenPages)
+                    val scale = if (settings.scaleType == ScaleType.CUSTOM) settings.customScalePercent / 100f else 1.0f
+
+                    val aspectSrc = bitmap.width.toFloat() / bitmap.height
+                    val aspectDst = cellW / cellH
+                    var drawW = cellW
+                    var drawH = cellH
+                    if (aspectSrc > aspectDst) {
+                        drawH = drawW / aspectSrc
+                    } else {
+                        drawW = drawH * aspectSrc
+                    }
+
+                    drawW *= scale
+                    drawH *= scale
+                    val offX = cellX + (cellW - drawW) / 2
+                    val offY = cellY + (cellH - drawH) / 2
+                    val destRect = RectF(offX, offY, offX + drawW, offY + drawH)
+                    val paint = Paint().apply { isFilterBitmap = true; isAntiAlias = true }
+                    canvas!!.drawBitmap(bitmap, null, destRect, paint)
+
+                    if (settings.showBorder) {
+                        val borderPaint = Paint().apply { color = Color.LTGRAY; style = Paint.Style.STROKE; strokeWidth = 1f }
+                        canvas.drawRect(destRect, borderPaint)
+                    }
+                }
+                itemsOnPage++
+
+                if (itemsOnPage >= settings.pagesPerSheet) {
+                    outputDoc.finishPage(currentPage)
+                    itemsOnPage = 0
+                }
+            }
+
+            if (itemsOnPage > 0) {
+                outputDoc.finishPage(currentPage)
+            }
+
+            onProgress?.invoke(0.9f, "Saving file...")
+            val timeStamp = SimpleDateFormat("HHmmss", Locale.getDefault()).format(Date())
+            val finalName = "${originalFileName}_PrintPDF_$timeStamp.pdf"
+            val outputUri = saveToDownloads(context, outputDoc, finalName)
+            outputDoc.close()
+
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            showSavedNotification(finalName, outputUri)
+            onProgress?.invoke(1.0f, "Done!")
+            onComplete?.invoke(outputUri)
+            stopSelf()
+        } catch (e: Exception) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            e.printStackTrace()
+        }
+    }
+
+    private suspend fun savePdfFromPdf(context: Context, settings: PdfSettings, originalFileName: String) {
+        try {
+            updateNotification(0, "Processing PDF...")
+            onProgress?.invoke(0f, "Starting render...")
+
+            val inputFile = File(cacheDir, "temp_import.pdf")
+            if (!inputFile.exists()) {
+                onProgress?.invoke(1f, "Error: No source file found.")
+                return
+            }
+
+            val inputFd =
+                ParcelFileDescriptor.open(inputFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            val renderer = PdfRenderer(inputFd)
+            val totalInputPages = renderer.pageCount
+
+            val pagesToProcess = when (settings.pageSelectionType) {
+                PageSelectionType.ALL -> (0 until totalInputPages).toList()
+                PageSelectionType.ODD -> (0 until totalInputPages).filter { (it + 1) % 2 != 0 }
+                PageSelectionType.EVEN -> (0 until totalInputPages).filter { (it + 1) % 2 == 0 }
+                PageSelectionType.CUSTOM -> parseCustomPages(settings.customPageString, totalInputPages)
+            }
+
+            val finalPagesList = if (settings.printingMode == PrintingMode.DOUBLE_SIDED) {
+                val result = mutableListOf<Int?>()
+                for (pageIndex in pagesToProcess) {
+                    result.add(pageIndex)
+                    result.add(null)
+                }
+                result.dropLast(1)
+            } else {
+                pagesToProcess.map { it as Int? }
+            }
+
+            val outputDoc = PdfDocument()
+            val (outW, outH) =
+                PageSizeUtils.getDimensions(settings.pageSizeName, settings.orientation)
+
+            val spacingBetweenPages = if (settings.marginType == MarginType.PRESET) {
+                MarginPresets.getMarginInPoints(settings.marginPreset)
+            } else {
+                MarginPresets.convertMmToPoints(settings.customMarginMm)
+            }
+
+            val (cols, rows) = when (settings.pagesPerSheet) {
+                1 -> 1 to 1
+                2 -> if (settings.orientation == Orientation.LANDSCAPE) 2 to 1 else 1 to 2
+                4 -> 2 to 2
+                6 -> if (settings.orientation == Orientation.LANDSCAPE) 3 to 2 else 2 to 3
+                9 -> 3 to 3
+                16 -> 4 to 4
+                else -> 1 to 1
+            }
+
+            val totalSpacingWidth = spacingBetweenPages * (cols - 1)
+            val totalSpacingHeight = spacingBetweenPages * (rows - 1)
+            val availableW = outW - totalSpacingWidth
+            val availableH = outH - totalSpacingHeight
+            val cellW = availableW / cols
+            val cellH = availableH / rows
+
+            var itemsOnPage = 0
+            var currentPageInfo: PdfDocument.PageInfo? = null
+            var currentPage: PdfDocument.Page? = null
+            var canvas: Canvas? = null
+
+            for ((index, pageIndex) in finalPagesList.withIndex()) {
+                val progress = (index.toFloat() / finalPagesList.size * 100).toInt()
+                updateNotification(progress, "Rendering ${index + 1}/${finalPagesList.size}")
+                onProgress?.invoke(progress / 100f, "Rendering...")
+
+                if (itemsOnPage == 0) {
+                    currentPageInfo =
+                        PdfDocument.PageInfo.Builder(outW.toInt(), outH.toInt(), index + 1)
+                            .create()
+                    currentPage = outputDoc.startPage(currentPageInfo)
+                    canvas = currentPage!!.canvas
+                    canvas.drawColor(Color.WHITE)
+                }
+
+                if (pageIndex != null) {
+                    val inpPage = renderer.openPage(pageIndex)
+                    val bitmapW = inpPage.width * 2
+                    val bitmapH = inpPage.height * 2
+                    val bitmap =
+                        Bitmap.createBitmap(bitmapW, bitmapH, Bitmap.Config.ARGB_8888)
+                    inpPage.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                    inpPage.close()
+
+                    val col = itemsOnPage % cols
+                    val row = itemsOnPage / cols
+                    val cellX = col * (cellW + spacingBetweenPages)
+                    val cellY = row * (cellH + spacingBetweenPages)
+
+                    var scale = 1.0f
+                    if (settings.scaleType == ScaleType.CUSTOM) {
+                        scale = settings.customScalePercent / 100f
+                    }
+
+                    val aspectSrc = bitmap.width.toFloat() / bitmap.height
+                    val aspectDst = cellW / cellH
+
+                    var drawW = cellW
+                    var drawH = cellH
+
+                    if (aspectSrc > aspectDst) {
+                        drawH = drawW / aspectSrc
+                    } else {
+                        drawW = drawH * aspectSrc
+                    }
+
+                    drawW *= scale
+                    drawH *= scale
+
+                    val offX = cellX + (cellW - drawW) / 2
+                    val offY = cellY + (cellH - drawH) / 2
+
+                    val destRect = RectF(offX, offY, offX + drawW, offY + drawH)
+
+                    val paint = Paint().apply {
+                        isFilterBitmap = true
+                        isAntiAlias = true
+                    }
+                    canvas!!.drawBitmap(bitmap, null, destRect, paint)
+
+                    if (settings.showBorder) {
+                        val borderPaint = Paint().apply {
+                            color = Color.LTGRAY
+                            style = Paint.Style.STROKE
+                            strokeWidth = 1f
+                        }
+                        canvas!!.drawRect(destRect, borderPaint)
+                    }
+
+                    bitmap.recycle()
+                }
+
+                itemsOnPage++
+
+                if (itemsOnPage >= settings.pagesPerSheet) {
+                    outputDoc.finishPage(currentPage)
+                    itemsOnPage = 0
+                }
+            }
+
+            if (itemsOnPage > 0) {
+                outputDoc.finishPage(currentPage)
+            }
+
+            renderer.close()
+            inputFd.close()
+
+            onProgress?.invoke(0.9f, "Saving file...")
+
+            val timeStamp =
+                SimpleDateFormat("HHmmss", Locale.getDefault()).format(Date())
+            val finalName = "${originalFileName}_PrintPDF_$timeStamp.pdf"
+
+            val outputUri = saveToDownloads(context, outputDoc, finalName)
+            outputDoc.close()
+
+            stopForeground(STOP_FOREGROUND_REMOVE)
+
+            showSavedNotification(finalName, outputUri)
+
+            onProgress?.invoke(1.0f, "Done!")
+            onComplete?.invoke(outputUri)
+
+            stopSelf()
+
+        } catch (e: Exception) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            e.printStackTrace()
+        }
+    }
+
+    private fun loadBitmapFromUri(uri: Uri, context: Context): Bitmap? {
+        return try {
+            val inputStream = context.contentResolver.openInputStream(uri)
+            val options = BitmapFactory.Options().apply {
+                inSampleSize = 2
+            }
+            val bitmap = BitmapFactory.decodeStream(inputStream, null, options)
+            inputStream?.close()
+            bitmap
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -368,7 +526,7 @@ class PdfProcessingService : Service() {
     }
 
     private fun updateNotification(progress: Int, text: String) {
-        notificationManager?.notify(1, createNotification(progress, text))
+        notificationManager?.notify(notificationId, createNotification(progress, text))
     }
 
     private fun showSavedNotification(fileName: String, uri: Uri?) {

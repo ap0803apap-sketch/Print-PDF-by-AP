@@ -13,8 +13,8 @@ android {
         applicationId = "com.ap.print.pdf"
         minSdk = 28
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0(15-02-26)"
+        versionCode = 2
+        versionName = "2.0.0(21-02-26)"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -35,9 +35,9 @@ android {
     }
 
 
-    // 🔥 REQUIRED FOR COMPOSE
     buildFeatures {
-        compose = true
+        viewBinding = true
+        compose = true   // ← Compose ENABLED! ✅
     }
 }
 

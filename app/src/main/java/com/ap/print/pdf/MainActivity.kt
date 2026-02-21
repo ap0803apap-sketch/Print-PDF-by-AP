@@ -7,7 +7,8 @@ import android.content.Context
 import android.net.Uri
 import android.content.Intent
 import android.content.ServiceConnection
-
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -16,6 +17,7 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
@@ -32,6 +34,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextDecoration
@@ -39,36 +42,52 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.material.icons.outlined.StayCurrentPortrait
+import androidx.compose.material.icons.outlined.StayCurrentLandscape
+import androidx.activity.compose.BackHandler
 
 class MainActivity : ComponentActivity() {
 
-    // Helper to extract URI from intent
     private fun getSharedUri(intent: Intent?): Uri? {
         return if (intent?.action == Intent.ACTION_SEND) {
             intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
         } else null
     }
 
+    private fun getSharedUris(intent: Intent?): List<Uri> {
+        val uris = mutableListOf<Uri>()
+        if (intent?.action == Intent.ACTION_SEND_MULTIPLE) {
+            intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)?.forEach {
+                uris.add(it)
+            }
+        } else if (intent?.action == Intent.ACTION_SEND) {
+            getSharedUri(intent)?.let { uris.add(it) }
+        }
+        return uris
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. Get URI from initial launch or share
         val initialUri = getSharedUri(intent)
+        val initialUris = getSharedUris(intent)
 
         setContent {
             val themeViewModel: ThemeViewModel = viewModel()
             val themeMode = themeViewModel.themeMode.collectAsState().value
             val dynamicColor = themeViewModel.dynamicColor.collectAsState().value
 
-            // Create MainViewModel here to access it if needed
             val mainViewModel: MainViewModel = viewModel()
 
-            // 2. Handle new Intents (Share when app is already open)
             DisposableEffect(Unit) {
                 val listener = androidx.core.util.Consumer<Intent> { newIntent ->
-                    val newUri = getSharedUri(newIntent)
-                    if (newUri != null) {
-                        mainViewModel.loadPdf(newUri, this@MainActivity)
+                    val newUris = getSharedUris(newIntent)
+                    if (newUris.isNotEmpty()) {
+                        if (newUris.size == 1 && newUris[0].toString().endsWith(".pdf")) {
+                            mainViewModel.loadPdf(newUris[0], this@MainActivity)
+                        } else {
+                            mainViewModel.loadImages(newUris, this@MainActivity)
+                        }
                     }
                 }
                 addOnNewIntentListener(listener)
@@ -81,24 +100,24 @@ class MainActivity : ComponentActivity() {
             ) {
                 MainScreen(
                     initialUri = initialUri,
+                    initialUris = initialUris,
                     currentThemeMode = themeMode,
                     onThemeModeChange = { themeViewModel.setTheme(it) },
                     isDynamicColor = dynamicColor,
                     onDynamicColorChange = { themeViewModel.setDynamic(it) },
-                    viewModel = mainViewModel // Pass the same instance
+                    viewModel = mainViewModel
                 )
             }
         }
     }
 
-    // Handle PDF share when app already open (Required for singleTask/singleTop)
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
     }
 }
 
-// --- VIEW MODEL ---
+// --- ENHANCED VIEW MODEL WITH IMAGE SUPPORT ---
 class MainViewModel : ViewModel() {
     var pdfService: PdfProcessingService? = null
     var isBound by mutableStateOf(false)
@@ -106,6 +125,16 @@ class MainViewModel : ViewModel() {
     var processingState by mutableStateOf(ProcessingState())
     var currentFileName by mutableStateOf("document")
     var currentUri by mutableStateOf<Uri?>(null)
+
+    // NEW: Image support
+    var currentImageUris by mutableStateOf<List<Uri>>(emptyList())
+    var isLoadingImages by mutableStateOf(false)
+    var currentContentType by mutableStateOf(ContentType.PDF)
+    var cachedImageBitmaps by mutableStateOf<List<Bitmap>>(emptyList())
+
+    enum class ContentType {
+        PDF, IMAGES
+    }
 
     private val defaultSettings = PdfSettings(
         pageSelectionType = PageSelectionType.ALL,
@@ -150,11 +179,14 @@ class MainViewModel : ViewModel() {
         }
     }
 
+    // ORIGINAL: Load PDF
     fun loadPdf(uri: Uri, context: Context) {
         currentUri = uri
-        processingState = processingState.copy(isProcessing = true, message = "Importing...")
+        currentImageUris = emptyList()
+        currentContentType = ContentType.PDF
+        cachedImageBitmaps = emptyList()
+        processingState = processingState.copy(isProcessing = true, message = "Importing PDF...")
 
-        // Safety check for content resolver
         try {
             context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
                 if (cursor.moveToFirst()) {
@@ -169,21 +201,72 @@ class MainViewModel : ViewModel() {
         pdfService?.loadPdf(uri, context.contentResolver)
     }
 
-    fun refreshPreview(context: Context) {
-        currentUri?.let { uri ->
-            processingState = processingState.copy(isProcessing = true, message = "Refreshing preview...")
-            pdfService?.loadPdf(uri, context.contentResolver)
+    // NEW: Load Images
+    fun loadImages(uris: List<Uri>, context: Context) {
+        if (uris.isEmpty()) return
+
+        currentImageUris = uris
+        currentUri = null
+        currentContentType = ContentType.IMAGES
+        isLoadingImages = true
+        currentFileName = "images_document"
+        processingState = processingState.copy(isProcessing = true, message = "Loading images...")
+
+        try {
+            pdfService?.processImages(uris, context, settings)
+        } catch (e: Exception) {
+            processingState = processingState.copy(isProcessing = false, message = "Error loading images")
         }
     }
 
+    // ORIGINAL: Refresh Preview
+    fun refreshPreview(context: Context) {
+        when (currentContentType) {
+            ContentType.PDF -> {
+                currentUri?.let { uri ->
+                    processingState = processingState.copy(isProcessing = true, message = "Refreshing preview...")
+                    pdfService?.loadPdf(uri, context.contentResolver)
+                }
+            }
+            ContentType.IMAGES -> {
+                if (currentImageUris.isNotEmpty()) {
+                    processingState = processingState.copy(isProcessing = true, message = "Refreshing images...")
+                    pdfService?.processImages(currentImageUris, context, settings)
+                }
+            }
+        }
+    }
+
+    // ORIGINAL: Reset Settings
     fun resetSettings() {
         settings = defaultSettings
     }
 
+    // ORIGINAL: Save PDF
     fun savePdf(context: Context) {
         processingState = processingState.copy(isProcessing = true)
         pdfService?.savePdf(context, settings, currentFileName)
     }
+
+    // NEW: Reset content
+    fun resetContent() {
+        currentUri = null
+        currentImageUris = emptyList()
+        currentContentType = ContentType.PDF
+        currentFileName = "document"
+        cachedImageBitmaps = emptyList()
+        processingState = processingState.copy(
+            isProcessing = false,
+            message = "",
+            progress = 0f,
+            previewBitmap = null
+        )
+    }
+}
+
+// --- NEW: CONTENT TYPE ENUM ---
+enum class ContentType {
+    PDF, IMAGES
 }
 
 // --- UI SCREENS ---
@@ -191,6 +274,7 @@ class MainViewModel : ViewModel() {
 @Composable
 fun MainScreen(
     initialUri: Uri?,
+    initialUris: List<Uri> = emptyList(),
     currentThemeMode: AppThemeMode,
     onThemeModeChange: (AppThemeMode) -> Unit,
     isDynamicColor: Boolean,
@@ -199,24 +283,109 @@ fun MainScreen(
 ) {
     val context = LocalContext.current
     var showSettings by remember { mutableStateOf(false) }
+    var showExitDialog by remember { mutableStateOf(false) }
 
-    // Bind PDF service
+    BackHandler {
+        if (showSettings) {
+            showSettings = false   // Go back from settings first
+        } else {
+            showExitDialog = true  // Show exit dialog
+        }
+    }
+
     LaunchedEffect(Unit) {
         viewModel.bindService(context)
     }
 
-    // Load shared PDF (Initial launch)
     LaunchedEffect(initialUri, viewModel.isBound) {
         if (initialUri != null && viewModel.isBound && viewModel.currentUri == null) {
             viewModel.loadPdf(initialUri, context)
         }
     }
 
-    // File picker
+    LaunchedEffect(initialUris, viewModel.isBound) {
+        if (initialUris.isNotEmpty() && viewModel.isBound && viewModel.currentImageUris.isEmpty()) {
+            viewModel.loadImages(initialUris, context)
+        }
+    }
+
+    // General file picker for PDFs, using the Storage Access Framework.
+    // This allows users to select files from a wide range of sources,
+    // including local storage, cloud providers, and apps like "My Files".
     val filePicker =
         rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             uri?.let { viewModel.loadPdf(it, context) }
         }
+
+    // Modern photo picker for selecting multiple images.
+    // This provides a user-friendly interface and access to cloud-based
+    // photo providers like Google Photos.
+    // ----------------------------------------------------
+// CUSTOM IMAGE PICKER (Prefers Gallery Apps)
+// ----------------------------------------------------
+    val legacyImagePicker =
+        rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == ComponentActivity.RESULT_OK) {
+                val data = result.data
+                val uris = mutableListOf<Uri>()
+
+                data?.clipData?.let { clip ->
+                    for (i in 0 until clip.itemCount) {
+                        uris.add(clip.getItemAt(i).uri)
+                    }
+                } ?: data?.data?.let { uris.add(it) }
+
+                if (uris.isNotEmpty()) {
+                    viewModel.loadImages(uris, context)
+                }
+            }
+        }
+
+// Fallback Android Photo Picker
+    val fallbackPhotoPicker =
+        rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris ->
+            if (uris.isNotEmpty()) viewModel.loadImages(uris, context)
+        }
+
+// ----------------------------------------------------
+// CUSTOM PDF PICKER (Prefers File Managers)
+// ----------------------------------------------------
+    val legacyPdfPicker =
+        rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode == ComponentActivity.RESULT_OK) {
+                result.data?.data?.let {
+                    viewModel.loadPdf(it, context)
+                }
+            }
+        }
+
+// Fallback Android SAF picker
+    val fallbackPdfPicker =
+        rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            uri?.let { viewModel.loadPdf(it, context) }
+        }
+
+    // ----------------------------------------------------
+// Helper Functions
+// ----------------------------------------------------
+    fun launchImagePicker() {
+        val intent = Intent(Intent.ACTION_PICK).apply {
+            type = "image/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        }
+
+        legacyImagePicker.launch(intent)
+    }
+
+    fun launchPdfPicker() {
+        val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+            type = "application/pdf"
+            addCategory(Intent.CATEGORY_OPENABLE)
+        }
+
+        legacyPdfPicker.launch(intent)
+
+    }
 
     // Settings Screen
     if (showSettings) {
@@ -251,9 +420,8 @@ fun MainScreen(
                 ) {
                     FloatingActionButton(
                         onClick = { viewModel.savePdf(context) },
-                        containerColor = DeepPlum,
                         contentColor = Color.White,
-                        shape = CircleShape
+                        containerColor = MaterialTheme.colorScheme.primary,
                     ) {
                         Icon(Icons.Default.Done, contentDescription = "Save")
                     }
@@ -271,21 +439,67 @@ fun MainScreen(
 
                 if (viewModel.processingState.previewBitmap == null) {
 
-                    Button(
-                        onClick = { filePicker.launch(arrayOf("application/pdf")) },
-                        modifier = Modifier
-                            .padding(top = 80.dp)
-                            .height(72.dp)
-                            .width(240.dp),
-                        shape = RoundedCornerShape(36.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = ExpressivePink,
-                            contentColor = Color.Black
-                        )
+                    // NEW: Initial screen with two buttons
+                    Column(
+                        modifier = Modifier.fillMaxSize(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
                     ) {
-                        Icon(Icons.Default.Add, null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Pick PDF File", fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(40.dp))
+
+                        Text(
+                            "Print PDF & Images",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.ExtraBold,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+
+                        Text(
+                            "Select a file to get started",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(bottom = 60.dp)
+                        )
+
+                        // Pick PDF File Button
+                        Button(
+                            onClick = { launchPdfPicker() },
+                            modifier = Modifier
+                                .padding(horizontal = 16.dp)
+                                .fillMaxWidth()
+                                .height(72.dp),
+                            shape = RoundedCornerShape(36.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary,
+                                contentColor = Color.Black
+                            )
+                        ) {
+                            Icon(Icons.Default.PictureAsPdf, null, modifier = Modifier.size(28.dp), tint =MaterialTheme.colorScheme.onPrimary)
+                            Spacer(Modifier.width(12.dp))
+                            Text("Pick PDF File", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = MaterialTheme.colorScheme.onPrimary)
+                        }
+
+                        Spacer(Modifier.height(16.dp))
+
+                        // NEW: Pick Multiple Images Button
+                        Button(
+                            onClick = { launchImagePicker() },
+                            modifier = Modifier
+                                .padding(horizontal = 16.dp)
+                                .fillMaxWidth()
+                                .height(72.dp),
+                            shape = RoundedCornerShape(36.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.primary,
+                                contentColor = Color.White
+                            )
+                        ) {
+                            Icon(Icons.Default.Image, null, modifier = Modifier.size(28.dp), tint =MaterialTheme.colorScheme.onPrimary )
+                            Spacer(Modifier.width(12.dp))
+                            Text("Pick Multiple Images", fontWeight = FontWeight.Bold, fontSize = 16.sp, color = MaterialTheme.colorScheme.onPrimary,)
+                        }
+
+                        Spacer(Modifier.height(60.dp))
                     }
 
                 } else {
@@ -302,9 +516,13 @@ fun MainScreen(
                             .padding(16.dp)
                             .then(
                                 if (isPortrait) {
-                                    Modifier.height(320.dp).aspectRatio(0.7f)
+                                    Modifier
+                                        .height(320.dp)
+                                        .aspectRatio(0.7f)
                                 } else {
-                                    Modifier.height(240.dp).aspectRatio(1.4f)
+                                    Modifier
+                                        .height(240.dp)
+                                        .aspectRatio(1.4f)
                                 }
                             ),
                         shape = RoundedCornerShape(32.dp),
@@ -319,6 +537,17 @@ fun MainScreen(
                         }
                     }
 
+                    // NEW: Show content type indicator
+                    Text(
+                        when (viewModel.currentContentType) {
+                            MainViewModel.ContentType.PDF -> "PDF Document"
+                            MainViewModel.ContentType.IMAGES -> "Image Document (${viewModel.currentImageUris.size} images)"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -326,37 +555,93 @@ fun MainScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
 
-                        Button(
-                            onClick = { filePicker.launch(arrayOf("application/pdf")) },
-                            modifier = Modifier.weight(1f).height(40.dp),
-                            shape = RoundedCornerShape(20.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = ExpressivePink,
-                                contentColor = Color.Black
-                            )
-                        ) {
-                            Icon(Icons.Default.FolderOpen, null, Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Pick File", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+
+
+                        // Dropdown menu for file selection
+                        var showFileMenu by remember { mutableStateOf(false) }
+                        Box(modifier = Modifier.weight(1f)) {
+                            Button(
+                                onClick = { showFileMenu = true },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(40.dp),
+                                shape = RoundedCornerShape(20.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = MaterialTheme.colorScheme.primary,
+                                    contentColor = Color.Black
+                                )
+                            ) {
+                                Icon(
+                                    painter = painterResource(id = R.drawable.replace_file),
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+
+                                Spacer(Modifier.width(4.dp))
+
+                                Text("Replace", fontSize = 12.sp, fontWeight = FontWeight.Bold,  color = MaterialTheme.colorScheme.onPrimary)
+                            }
+
+                            // NEW: Radio selection dropdown menu
+                            DropdownMenu(
+                                expanded = showFileMenu,
+                                onDismissRequest = { showFileMenu = false },
+                                modifier = Modifier.width(200.dp)
+                            ) {
+
+                                DropdownMenuItem(
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.PictureAsPdf,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    },
+                                    text = { Text("Select PDF") },
+                                    onClick = {
+                                        launchPdfPicker()
+                                        showFileMenu = false
+                                    }
+                                )
+
+                                DropdownMenuItem(
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Image,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    },
+                                    text = { Text("Select Images") },
+                                    onClick = {
+                                        launchImagePicker()
+                                        showFileMenu = false
+                                    }
+                                )
+                            }
                         }
 
                         Button(
                             onClick = { viewModel.refreshPreview(context) },
-                            modifier = Modifier.weight(1f).height(40.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(40.dp),
                             shape = RoundedCornerShape(20.dp),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = DeepPlum,
-                                contentColor = Color.White
+                                containerColor = MaterialTheme.colorScheme.primary,
+                                contentColor = MaterialTheme.colorScheme.onPrimary
                             )
                         ) {
                             Icon(Icons.Default.Refresh, null, Modifier.size(16.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("Refresh", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Text("Refresh", fontSize = 12.sp, fontWeight = FontWeight.Bold,  color = MaterialTheme.colorScheme.onPrimary)
                         }
 
                         Button(
                             onClick = { viewModel.resetSettings() },
-                            modifier = Modifier.weight(1f).height(40.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(40.dp),
                             shape = RoundedCornerShape(20.dp),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = MaterialTheme.colorScheme.errorContainer,
@@ -381,9 +666,53 @@ fun MainScreen(
                             .height(8.dp),
                         strokeCap = StrokeCap.Round
                     )
+                    Text(
+                        viewModel.processingState.message,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(8.dp)
+                    )
                 }
             }
         }
+    }
+    if (showExitDialog) {
+        AlertDialog(
+            onDismissRequest = { showExitDialog = false },
+
+            icon = {
+                Icon(Icons.Default.ExitToApp, contentDescription = null)
+            },
+
+            title = {
+                Text("Exit App")
+            },
+
+            text = {
+                Text("Are you sure you want to close Print PDF?")
+            },
+
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showExitDialog = false
+                        (context as ComponentActivity).finish()
+                    }
+                ) {
+                    Text(
+                        "Exit",
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            },
+
+            dismissButton = {
+                TextButton(onClick = { showExitDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
 }
 
@@ -393,9 +722,11 @@ fun ControlPanel(viewModel: MainViewModel) {
     val settings = viewModel.settings
     val availableSizes = PageSizeUtils.getAvailableSizes()
 
-    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp), ) {
 
-        ExpressiveSection(title = "Page Selection") {
+        ExpressiveSection(title = "Page Selection")
+
+        {
             DropdownSelector(
                 label = "Pages",
                 options = PageSelectionType.values().map { it.name },
@@ -418,7 +749,8 @@ fun ControlPanel(viewModel: MainViewModel) {
             }
         }
 
-        ExpressiveSection(title = "Print Mode") {
+        ExpressiveSection(title = "Print Mode")
+        {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     RadioButton(
@@ -427,8 +759,8 @@ fun ControlPanel(viewModel: MainViewModel) {
                     )
                     Spacer(Modifier.width(8.dp))
                     Column {
-                        Text("1-Sided (Single-sided)", fontWeight = FontWeight.Medium)
-                        Text("Print pages as they are", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("1-Sided (Single-sided)", fontWeight = FontWeight.Medium, )
+                        Text("Print pages as they are", style = MaterialTheme.typography.bodySmall,)
                     }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -438,8 +770,8 @@ fun ControlPanel(viewModel: MainViewModel) {
                     )
                     Spacer(Modifier.width(8.dp))
                     Column {
-                        Text("2-Sided (Double-sided)", fontWeight = FontWeight.Medium)
-                        Text("Continuous pages with blank pages between", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("2-Sided (Double-sided)", fontWeight = FontWeight.Medium,  )
+                        Text("Continuous pages with blank pages between", style = MaterialTheme.typography.bodySmall, )
                     }
                 }
             }
@@ -453,7 +785,7 @@ fun ControlPanel(viewModel: MainViewModel) {
                         onClick = { viewModel.settings = settings.copy(marginType = MarginType.PRESET) }
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text("Preset Margins", fontWeight = FontWeight.Medium)
+                    Text("Preset Margins", fontWeight = FontWeight.Medium,  )
                 }
 
                 if (settings.marginType == MarginType.PRESET) {
@@ -475,7 +807,7 @@ fun ControlPanel(viewModel: MainViewModel) {
                         onClick = { viewModel.settings = settings.copy(marginType = MarginType.CUSTOM) }
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text("Custom Margin", fontWeight = FontWeight.Medium)
+                    Text("Custom Margin", fontWeight = FontWeight.Medium,  )
                 }
 
                 if (settings.marginType == MarginType.CUSTOM) {
@@ -500,7 +832,7 @@ fun ControlPanel(viewModel: MainViewModel) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Box(modifier = Modifier.weight(1f)) {
                     DropdownSelector(
-                        label = "Pages per sheet",
+                        label = "Pages per sheet" ,
                         options = listOf("1", "2", "4", "6", "9", "16"),
                         selected = settings.pagesPerSheet.toString(),
                         onSelect = { newValue ->
@@ -522,12 +854,13 @@ fun ControlPanel(viewModel: MainViewModel) {
 
             Spacer(Modifier.height(12.dp))
 
-            // Page Border Switch
             Row(
-                modifier = Modifier.fillMaxWidth().clickable { viewModel.settings = settings.copy(showBorder = !settings.showBorder) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { viewModel.settings = settings.copy(showBorder = !settings.showBorder) },
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("Show Page Borders", Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+                Text("Show Page Borders", Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge,  )
                 Switch(checked = settings.showBorder, onCheckedChange = { newValue ->
                     viewModel.settings = settings.copy(showBorder = newValue)
                 })
@@ -543,8 +876,8 @@ fun ControlPanel(viewModel: MainViewModel) {
                     )
                     Spacer(Modifier.width(8.dp))
                     Column {
-                        Text("Fit to Page", fontWeight = FontWeight.Medium)
-                        Text("Auto-scale to fit page size", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Fit to Page", fontWeight = FontWeight.Medium,  )
+                        Text("Auto-scale to fit page size", style = MaterialTheme.typography.bodySmall,  )
                     }
                 }
 
@@ -557,8 +890,8 @@ fun ControlPanel(viewModel: MainViewModel) {
                     )
                     Spacer(Modifier.width(8.dp))
                     Column {
-                        Text("Custom Scale", fontWeight = FontWeight.Medium)
-                        Text("Set custom scale percentage", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Custom Scale", fontWeight = FontWeight.Medium, )
+                        Text("Set custom scale percentage", style = MaterialTheme.typography.bodySmall,  )
                     }
                 }
 
@@ -585,7 +918,7 @@ fun ControlPanel(viewModel: MainViewModel) {
                         Text(
                             "${settings.customScalePercent}%",
                             style = MaterialTheme.typography.labelLarge,
-                            color = ExpressivePink,
+                            color = MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.Bold,
                             modifier = Modifier.weight(0.5f)
                         )
@@ -593,7 +926,6 @@ fun ControlPanel(viewModel: MainViewModel) {
 
                     Spacer(Modifier.height(8.dp))
 
-                    // Scale slider
                     Slider(
                         value = settings.customScalePercent.toFloat(),
                         onValueChange = { newValue ->
@@ -611,27 +943,53 @@ fun ControlPanel(viewModel: MainViewModel) {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("10%", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text("100%", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        Text("200%", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("10%", style = MaterialTheme.typography.labelSmall,  color = MaterialTheme.colorScheme.onPrimary)
+                        Text("100%", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onPrimary)
+                        Text("200%", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onPrimary)
                     }
                 }
             }
         }
 
-        ExpressiveSection(title = "Orientation") {
+        ExpressiveSection(
+            title = "Orientation"
+
+        ) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+
                 listOf(Orientation.PORTRAIT, Orientation.LANDSCAPE).forEach { mode ->
+
                     val isSelected = settings.orientation == mode
+
                     Button(
                         onClick = { viewModel.settings = settings.copy(orientation = mode) },
                         modifier = Modifier.weight(1f),
                         shape = RoundedCornerShape(24.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isSelected) ExpressivePink else MaterialTheme.colorScheme.surfaceVariant,
+                            containerColor = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
                             contentColor = if (isSelected) Color.Black else MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                    ) { Text(mode.name) }
+                    ) {
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+
+                            // Icon based on orientation
+                            Icon(
+                                imageVector =
+                                    if (mode == Orientation.PORTRAIT)
+                                        Icons.Outlined.StayCurrentPortrait
+                                    else
+                                        Icons.Outlined.StayCurrentLandscape,
+                                contentDescription = null,
+                                modifier = Modifier.size(18.dp)
+                            )
+
+                            Text(mode.name)
+                        }
+                    }
                 }
             }
         }
@@ -641,7 +999,7 @@ fun ControlPanel(viewModel: MainViewModel) {
 @Composable
 fun ExpressiveSection(title: String, content: @Composable ColumnScope.() -> Unit) {
     Column {
-        Text(title, style = MaterialTheme.typography.labelLarge, color = DeepPlum, modifier = Modifier.padding(start = 12.dp, bottom = 4.dp))
+        Text(title, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(start = 12.dp, bottom = 4.dp))
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(28.dp),
@@ -659,7 +1017,9 @@ fun DropdownSelector(label: String, options: List<String>, selected: String, onS
         OutlinedTextField(
             readOnly = true, value = selected, onValueChange = {}, label = { Text(label) },
             trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-            modifier = Modifier.menuAnchor().fillMaxWidth(),
+            modifier = Modifier
+                .menuAnchor()
+                .fillMaxWidth(),
             shape = RoundedCornerShape(24.dp)
         )
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
@@ -683,7 +1043,10 @@ fun SettingsScreen(
     val uriHandler = LocalUriHandler.current
 
     Scaffold(topBar = { TopAppBar(title = { Text("Settings") }, navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, null) } }) }) { padding ->
-        Column(modifier = Modifier.padding(padding).verticalScroll(rememberScrollState()).padding(16.dp)) {
+        Column(modifier = Modifier
+            .padding(padding)
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)) {
             Text("Appearance", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(8.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -732,7 +1095,6 @@ fun SettingsScreen(
                         fontWeight = FontWeight.SemiBold
                     )
 
-                    // Email - Clickable
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -747,7 +1109,6 @@ fun SettingsScreen(
                                 try {
                                     context.startActivity(emailIntent)
                                 } catch (e: Exception) {
-                                    // Fallback to chooser if direct launch fails
                                     val fallbackIntent = Intent(Intent.ACTION_SEND).apply {
                                         type = "message/rfc822"
                                         putExtra(Intent.EXTRA_EMAIL, arrayOf("ap0803apap@gmail.com"))
@@ -776,14 +1137,11 @@ fun SettingsScreen(
                         )
                     }
 
-
-
-                    // GitHub - Clickable
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable {
-                                uriHandler.openUri("https://github.com/your-username/print-pdf")
+                                uriHandler.openUri("https://github.com/ap0803apap-sketch")
                             }
                             .padding(8.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -810,4 +1168,7 @@ fun SettingsScreen(
             )
         }
     }
+
+
+
 }

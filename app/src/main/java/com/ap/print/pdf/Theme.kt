@@ -31,12 +31,13 @@ val AmoledBlack = Color(0xFF000000)
 val DarkSurface = Color(0xFF0B0B0B)
 val DarkCard = Color(0xFF141414)
 val DarkOutline = Color(0xFF2A2A2A)
+val ExpressivePinkLight = Color(0xFFE94B7D)
 
 // -----------------------------
 // LIGHT THEME
 // -----------------------------
 private val LightColorScheme = lightColorScheme(
-    primary = DeepPlum,
+    primary = ExpressivePinkLight,
     onPrimary = Color.White,
     primaryContainer = SurfaceLavender,
     onPrimaryContainer = DeepPlum,
